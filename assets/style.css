@@ -136,6 +136,18 @@ section h2.sec::before {
   padding: 3px 10px; border-radius: 999px;
 }
 
+/* ---------- Publications ---------- */
+.pub .pub-authors { color: var(--text-dim); font-size: .92rem; margin-bottom: 6px; }
+.pub .pub-authors strong { color: var(--accent2); font-weight: 600; }
+.pub .pub-venue { color: var(--text-dim); font-size: .85rem; font-style: italic; margin-bottom: 14px; }
+.pub .abstract {
+  border-left: 3px solid var(--accent2);
+  background: rgba(56,208,168,.07);
+  padding: 12px 16px; border-radius: 0 10px 10px 0;
+  color: var(--text-dim); font-size: .9rem; margin: 14px 0;
+}
+.pub .abstract strong { color: var(--text); }
+
 ul.about-list { list-style: none; color: var(--text-dim); }
 ul.about-list li { padding-left: 22px; position: relative; margin-bottom: 10px; }
 ul.about-list li::before { content: "▹"; position: absolute; left: 0; color: var(--accent2); }
