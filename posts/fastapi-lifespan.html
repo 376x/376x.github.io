@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>用 Lifespan 管理 FastAPI 应用资源 · aubin 的博客</title>
+  <meta name="description" content="告别已废弃的 on_event：用 asynccontextmanager 的 Lifespan 模式管理 FastAPI 启动/关闭资源，与依赖注入无缝配合。" />
+  <link rel="stylesheet" href="../assets/style.css" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
+</head>
+<body>
+  <!-- Navbar -->
+  <nav>
+    <div class="nav-inner">
+      <a class="nav-logo" href="../index.html"><span class="dot"></span>aubin</a>
+      <div class="nav-links">
+        <a href="../index.html">首页</a>
+        <a href="../blog.html" class="active">博客</a>
+        <a href="../index.html#projects">项目</a>
+        <a href="../about.html">关于</a>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post">
+    <a class="back" href="../blog.html">← 返回博客列表</a>
+    <h1 class="title">用 Lifespan 管理 FastAPI 应用资源</h1>
+    <div class="post-meta">
+      <span class="date">2026-08-22</span>
+      <span># FastAPI</span><span># Lifespan</span><span># 最佳实践</span>
+    </div>
+
+    <div class="prose">
+      <p>
+        数据库连接池、HTTP 客户端、缓存连接 —— 这些资源要跟着应用一起创建和销毁。
+        老教程里的 <code>@app.on_event("startup")</code> 已经被官方<strong>标记为废弃</strong>，
+        现在的标准答案是 Lifespan。它不仅没变复杂，反而更优雅了。
+      </p>
+
+      <h2>1. 为什么 on_event 被废弃</h2>
+      <p>旧写法把启动和关闭逻辑拆散在多个装饰器回调里：</p>
+
+<pre><code class="language-python"># ❌ 旧写法（已废弃）
+@app.on_event("startup")
+async def startup():
+    app.state.pool = await create_pool(...)
+
+@app.on_event("startup")
+async def another_startup():
+    ...
+
+@app.on_event("shutdown")
+async def shutdown():
+    await app.state.pool.close()</code></pre>
+
+      <ul>
+        <li>同一个资源的创建/销毁逻辑<strong>分散在两个地方</strong>；</li>
+        <li>多个 startup 回调之间的执行顺序、依赖关系不明确；</li>
+        <li>无法使用 contextmanager 的异常语义（比如只清理已成功创建的资源）。</li>
+      </ul>
+
+      <h2>2. Lifespan：一个函数管到底</h2>
+      <p>Lifespan 是一个基于 <code>asynccontextmanager</code> 的异步上下文：
+      <code>yield</code> 之前是启动逻辑，之后是关闭逻辑，天然对称：</p>
+
+<pre><code class="language-python">from contextlib import asynccontextmanager
+from fastapi import FastAPI
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ---- startup ----
+    resources = await setup()
+    yield                       # ---- 应用运行中 ----
+    # ---- shutdown ----
+    await teardown(resources)
+
+app = FastAPI(lifespan=lifespan)</code></pre>
+
+      <blockquote><p>如果 startup 阶段抛异常，服务不会带着残缺状态启动；
+      shutdown 阶段则可以按依赖顺序逐层清理 —— 这些语义都是 contextmanager 自带的。</p></blockquote>
+
+      <h2>3. 生产可用的完整模板</h2>
+      <p>下面是我在项目里使用的模板：数据库连接池 + 共享 HTTP 客户端，
+      全部挂在 <code>app.state</code> 上：</p>
+
+<pre><code class="language-python">from contextlib import asynccontextmanager
+from typing import AsyncIterator
+
+import httpx
+from fastapi import FastAPI, Request
+from sqlalchemy.ext.asyncio import (
+    AsyncSession, async_sessionmaker, create_async_engine
+)
+
+DATABASE_URL = "mysql+aiomysql://user:pass@localhost/app"
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -&gt; AsyncIterator[None]:
+    # startup: 创建引擎与连接池
+    engine = create_async_engine(DATABASE_URL, pool_size=10, max_overflow=5)
+    app.state.session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    # startup: 复用一个带连接池的 httpx 客户端
+    app.state.http = httpx.AsyncClient(timeout=httpx.Timeout(5.0))
+
+    yield
+
+    # shutdown: 注意关闭顺序，后建的资源先关
+    await app.state.http.aclose()
+    await engine.dispose()
+
+app = FastAPI(lifespan=lifespan)</code></pre>
+
+      <p>两点工程细节：</p>
+      <ul>
+        <li><strong>httpx.AsyncClient 必须复用</strong>。每个请求新建客户端意味着每次都要经历 DNS/TCP/TLS 握手，连接池白瞎了；</li>
+        <li>关闭顺序与创建顺序相反：<code>http.aclose()</code> 在前，<code>engine.dispose()</code> 在后。</li>
+      </ul>
+
+      <h2>4. 与依赖注入配合使用</h2>
+      <p><code>app.state</code> 只是全局容器，真正把它接入类型安全的体系靠依赖。
+      路由里通过依赖拿到 session 工厂，测试时也能整体替换：</p>
+
+<pre><code class="language-python">from typing import Annotated
+from fastapi import Depends
+
+def get_session_factory(request: Request) -&gt; async_sessionmaker[AsyncSession]:
+    return request.app.state.session_factory
+
+SessionFactory = Annotated[
+    async_sessionmaker[AsyncSession],
+    Depends(get_session_factory),
+]
+
+@app.get("/users/{uid}")
+async def get_user(uid: int, factory: SessionFactory):
+    async with factory() as session:
+        user = await session.get(User, uid)
+        return {"id": user.id, "name": user.name}</code></pre>
+
+      <p>这样资源生命周期由 lifespan 统一管理，获取路径由依赖统一声明 ——
+      路由代码不出现任何"从哪拿资源"的细节。</p>
+
+      <h2>5. 多个子应用/一长串资源的组织技巧</h2>
+      <p>资源多了以后 lifespan 会变得很长，可以用嵌套的 asynccontextmanager 组合：</p>
+
+<pre><code class="language-python">@asynccontextmanager
+async def with_db(app: FastAPI):
+    app.state.engine = create_async_engine(DATABASE_URL)
+    yield
+    await app.state.engine.dispose()
+
+@asynccontextmanager
+async def with_http(app: FastAPI):
+    app.state.http = httpx.AsyncClient()
+    yield
+    await app.state.http.aclose()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with with_db(app), with_http(app):   # 支持多层嵌套
+        yield
+
+app = FastAPI(lifespan=lifespan)</code></pre>
+
+      <p>每个 resource 一个函数、独立可测，最后组合成总 lifespan —— 清晰且不失优雅。</p>
+
+      <h2>小结</h2>
+      <ul>
+        <li><code>on_event</code> 已废弃，新项目一律用 <code>lifespan</code> 参数；</li>
+        <li>Lifespan = 一个 asynccontextmanager，<code>yield</code> 前启动、后清理；</li>
+        <li>资源挂 <code>app.state</code>，通过 Request 依赖暴露给路由，保持类型安全；</li>
+        <li>资源多了就拆成多个小 contextmanager 嵌套组合。</li>
+      </ul>
+    </div>
+
+    <div class="end-mark">— 完 —</div>
+  </article>
+
+  <div class="next-posts container">
+    <h3>继续阅读</h3>
+    <a class="post-item" href="fastapi-dependency-injection.html">
+      <h3>FastAPI 依赖注入 Depends 的正确打开方式</h3>
+      <p>依赖嵌套、yield 资源管理、Annotated 复用 —— 把 Depends 用出设计模式的味道。</p>
+    </a>
+    <a class="post-item" href="fastapi-pydantic-v2.html">
+      <h3>Pydantic v2 实战：更快、更严格的输入校验</h3>
+      <p>Rust 内核带来的性能提升、新的校验器写法，以及序列化控制的实用技巧。</p>
+    </a>
+  </div>
+
+  <footer>
+    <div class="container">
+      © 2026 aubin ·
+      <a href="https://github.com/376x" target="_blank" rel="noopener">github.com/376x</a> ·
+      Powered by GitHub Pages
+    </div>
+  </footer>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <script>hljs.highlightAll();</script>
+</body>
+</html>

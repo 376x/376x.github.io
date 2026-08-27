@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>技术博客 · aubin</title>
+  <meta name="description" content="aubin 的技术博客：FastAPI、Python 异步编程、后端工程实践。" />
+  <link rel="stylesheet" href="assets/style.css" />
+</head>
+<body>
+  <!-- Navbar -->
+  <nav>
+    <div class="nav-inner">
+      <a class="nav-logo" href="index.html"><span class="dot"></span>aubin</a>
+      <div class="nav-links">
+        <a href="index.html">首页</a>
+        <a href="blog.html" class="active">博客</a>
+        <a href="index.html#projects">项目</a>
+        <a href="about.html">关于</a>
+      </div>
+    </div>
+  </nav>
+
+  <main class="container">
+    <header class="page-head">
+      <h1>技术博客 📝</h1>
+      <p>主要围绕 Python 后端开发 —— FastAPI、异步编程、工程实践。写作即复习。</p>
+    </header>
+
+    <section id="fastapi-series">
+      <h2 class="sec">FastAPI 系列</h2>
+
+      <a class="post-item" href="posts/fastapi-pydantic-v2.html">
+        <h3>Pydantic v2 实战：更快、更严格的输入校验</h3>
+        <p>Pydantic v2 用 Rust 重写了核心，序列化性能大幅提升，同时校验 API 也有不少破坏性变更。
+           本文结合迁移经验，整理 field_validator / model_validator / computed_field 等高频写法，以及严格模式与 Annotated 约束复用的技巧。</p>
+        <div class="post-meta"><span class="date">2026-08-26</span><span>约 8 分钟</span><span class="tag">FastAPI</span><span class="tag">Pydantic</span></div>
+      </a>
+
+      <a class="post-item" href="posts/fastapi-lifespan.html">
+        <h3>用 Lifespan 管理 FastAPI 应用资源</h3>
+        <p>@app.on_event 已被官方标记为废弃。Lifespan 基于 asynccontextmanager，
+           用一个函数就能清晰管理数据库连接池、httpx.AsyncClient 等资源的整个生命周期，
+           并能与依赖注入无缝配合。文末给出生产可用的完整模板。</p>
+        <div class="post-meta"><span class="date">2026-08-22</span><span>约 7 分钟</span><span class="tag">FastAPI</span><span class="tag">Lifespan</span></div>
+      </a>
+
+      <a class="post-item" href="posts/fastapi-async.html">
+        <h3>FastAPI 异步避坑指南：async def 还是 def？</h3>
+        <p>在 async def 里写 time.sleep 或同步 DB 调用，会让整个服务卡死 —— 这是 FastAPI 最常见的性能事故。
+           本文讲清两种路由声明的运行机制差异、线程池的适用边界，以及同步库的正确姿势。</p>
+        <div class="post-meta"><span class="date">2026-08-18</span><span>约 9 分钟</span><span class="tag">FastAPI</span><span class="tag">Asyncio</span></div>
+      </a>
+
+      <a class="post-item" href="posts/fastapi-dependency-injection.html">
+        <h3>FastAPI 依赖注入 Depends 的正确打开方式</h3>
+        <p>Depends 不只是"传参工具"。依赖可以嵌套、可以用 yield 管理资源生命周期、
+           可以通过 Annotated 声明一次处处复用。本文带你把 Depends 用出设计模式的味道，
+           覆盖分页、鉴权、DB 会话三大经典场景。</p>
+        <div class="post-meta"><span class="date">2026-08-10</span><span>约 10 分钟</span><span class="tag">FastAPI</span><span class="tag">DI</span></div>
+      </a>
+    </section>
+
+    <section id="more">
+      <h2 class="sec">更多系列（规划中）</h2>
+      <ul class="about-list">
+        <li>SQLAlchemy 2.0 异步模式与连接池调优</li>
+        <li>Docker 多阶段构建加速 Python 镜像</li>
+        <li>TurtleBot3 导航实战笔记</li>
+      </ul>
+    </section>
+  </main>
+
+  <footer>
+    <div class="container">
+      © 2026 aubin ·
+      <a href="https://github.com/376x" target="_blank" rel="noopener">github.com/376x</a> ·
+      Powered by GitHub Pages
+    </div>
+  </footer>
+</body>
+</html>

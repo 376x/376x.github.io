@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FastAPI 异步避坑指南：async def 还是 def？ · aubin 的博客</title>
+  <meta name="description" content="讲清 FastAPI 两种路由声明的运行机制差异：事件循环阻塞、线程池的适用边界、同步库的正确用法。" />
+  <link rel="stylesheet" href="../assets/style.css" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
+</head>
+<body>
+  <!-- Navbar -->
+  <nav>
+    <div class="nav-inner">
+      <a class="nav-logo" href="../index.html"><span class="dot"></span>aubin</a>
+      <div class="nav-links">
+        <a href="../index.html">首页</a>
+        <a href="../blog.html" class="active">博客</a>
+        <a href="../index.html#projects">项目</a>
+        <a href="../about.html">关于</a>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post">
+    <a class="back" href="../blog.html">← 返回博客列表</a>
+    <h1 class="title">FastAPI 异步避坑指南：async def 还是 def？</h1>
+    <div class="post-meta">
+      <span class="date">2026-08-18</span>
+      <span># FastAPI</span><span># Asyncio</span><span># 性能</span>
+    </div>
+
+    <div class="prose">
+      <p>
+        FastAPI 最吸引人的卖点之一是"原生异步"，但线上事故里最常见的性能问题恰恰也是异步用错了。
+        典型症状：<strong>平时接口很快，某个接口一慢，整个服务所有接口一起卡死</strong>。
+        这篇文章把这个问题的根因和应对方案一次性讲清楚。
+      </p>
+
+      <h2>1. 先搞清楚你的代码跑在哪里</h2>
+      <p>FastAPI 对两种路由函数签名的处理方式完全不同：</p>
+
+      <table>
+        <tr><th>声明方式</th><th>运行位置</th><th>并发能力来源</th></tr>
+        <tr><td><code>async def</code></td><td>主事件循环（单线程）</td><td>await 让出控制权时的任务切换</td></tr>
+        <tr><td><code>def</code></td><td>外部线程池（默认约 40 线程）</td><td>多线程并行处理同步阻塞调用</td></tr>
+      </table>
+
+      <p>
+        关键点：事件循环是<strong>单线程</strong>的。
+        所有 <code>async def</code> 路由共用这一个线程，任何一个协程不释放控制权，
+        其他所有请求就都得排队。
+      </p>
+
+      <h2>2. 反面教材：一个拖垮全站的接口</h2>
+
+<pre><code class="language-python"># ❌ 千万不要这样写
+import time
+import requests
+
+@app.get("/products/{pid}")
+async def get_product(pid: int):
+    resp = requests.get(f"https://erp.internal/api/products/{pid}")  # 同步 IO！
+    time.sleep(0.5)                                                   # 更致命！
+    return resp.json()</code></pre>
+
+      <p><code>requests.get</code> 和 <code>time.sleep</code> 都是同步阻塞调用：
+      在 <code>async def</code> 里执行时不会让出事件循环，
+      期间到达的所有请求全部堆积。压测表现通常是：这个接口 QPS 很低的同时，
+      其它本来正常的接口延迟也跟着暴涨。</p>
+
+      <h2>3. 正确姿势一：全程异步</h2>
+      <p>IO 栈有异步实现时，这是最优解：</p>
+
+<pre><code class="language-python">import asyncio
+from contextlib import asynccontextmanager
+
+import httpx
+from fastapi import FastAPI, Request
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with httpx.AsyncClient(timeout=5) as client:
+        app.state.http = client
+        yield
+
+app = FastAPI(lifespan=lifespan)
+
+@app.get("/products/{pid}")
+async def get_product(pid: int, request: Request):
+    client: httpx.AsyncClient = request.app.state.http
+    resp = await client.get(f"https://erp.internal/api/products/{pid}")
+    await asyncio.sleep(0.5)   # 异步等待，期间其他请求正常运行
+    return resp.json()</code></pre>
+
+      <blockquote><p>判断标准很简单：<strong>每个 await 点都必须是真的异步</strong>。
+      数据库用 asyncpg / SQLAlchemy async，Redis 用 redis.asyncio，HTTP 用 httpx / aiohttp。</p></blockquote>
+
+      <h2>4. 正确姿势二：丢进线程池</h2>
+      <p>当调用的库只有同步实现（很多老牌 SDK 就是这样），把它丢进线程池执行：</p>
+
+<pre><code class="language-python">from fastapi.concurrency import run_in_threadpool
+
+def sync_query_erp(pid: int) -&gt; dict:
+    conn = pymssql.connect(...)          # 只有同步驱动的内部系统
+    return query_product(conn, pid)
+
+@app.get("/legacy-products/{pid}")
+async def get_legacy_product(pid: int):
+    data = await run_in_threadpool(sync_query_erp, pid)
+    return data</code></pre>
+
+      <p>或者最省事的方式 —— 把路由直接写成普通 <code>def</code>，
+      FastAPI 会自动放到同一个线程池：</p>
+
+<pre><code class="language-python">@app.get("/legacy-products/{pid}")
+def get_legacy_product(pid: int):     # 普通 def，自动走线程池
+    return sync_query_erp(pid)</code></pre>
+
+      <h2>5. 决策表</h2>
+
+      <table>
+        <tr><th>场景</th><th>推荐写法</th></tr>
+        <tr><td>IO 且有异步库（DB/HTTP/Redis）</td><td><code>async def</code> + await 异步调用</td></tr>
+        <tr><td>IO 但只有同步库</td><td><code>def</code> 路由，或 <code>run_in_threadpool</code></td></tr>
+        <tr><td>CPU 密集（图像处理、加解密、大计算）</td><td>进程池（<code>ProcessPoolExecutor</code>）或独立 worker 服务</td></tr>
+        <tr><td>混合同步+异步</td><td>异步入库，同步片段包 <code>run_in_threadpool</code></td></tr>
+      </table>
+
+      <p>CPU 密集任务要特别注意：即使是 <code>def</code> 路由（线程池），Python GIL 也会让纯计算互相争抢，
+      大计算量应使用进程池：</p>
+
+<pre><code class="language-python">import asyncio
+from concurrent.futures import ProcessPoolExecutor
+from functools import partial
+
+process_pool = ProcessPoolExecutor(max_workers=4)
+
+def heavy_hash(data: bytes) -&gt; str:
+    import hashlib
+    return hashlib.pbkdf2_hmac("sha256", data, b"salt", 200_000).hex()
+
+@app.post("/hash")
+async def make_hash(payload: DataIn):
+    loop = asyncio.get_running_loop()
+    digest = await loop.run_in_executor(process_pool, heavy_hash, payload.data)
+    return {"digest": digest}</code></pre>
+
+      <h2>6. 怎么发现有人在阻塞事件循环？</h2>
+      <ul>
+        <li>开发环境开启 <code>asyncio</code> 慢回调日志：<code>loop.slow_callback_duration</code> 配合 <code>-X dev</code>；</li>
+        <li>使用 <strong>BlockBuster</strong> 这类库，在测试中对阻塞调用直接抛异常；</li>
+        <li>上线前用 locust 压测：观察单接口变慢时其它接口的 P99 是否连带恶化 —— 连带恶化基本就是事件循环被堵了。</li>
+      </ul>
+
+      <h2>小结</h2>
+      <ul>
+        <li><code>async def</code> 里不允许出现任何同步阻塞调用 —— 这是铁律；</li>
+        <li>没把握就用 <code>def</code>，FastAPI 的线程池兜底非常可靠；</li>
+        <li>CPU 密集交给进程池或独立服务，别让 Web 进程算数；</li>
+        <li>监控上盯住"多接口 P99 同时恶化"这一特征信号。</li>
+      </ul>
+    </div>
+
+    <div class="end-mark">— 完 —</div>
+  </article>
+
+  <div class="next-posts container">
+    <h3>继续阅读</h3>
+    <a class="post-item" href="fastapi-pydantic-v2.html">
+      <h3>Pydantic v2 实战：更快、更严格的输入校验</h3>
+      <p>Rust 内核带来的性能提升、新的校验器写法，以及序列化控制的实用技巧。</p>
+    </a>
+    <a class="post-item" href="fastapi-lifespan.html">
+      <h3>用 Lifespan 管理 FastAPI 应用资源</h3>
+      <p>告别已废弃的 on_event：用一个函数管理启动/关闭资源。</p>
+    </a>
+  </div>
+
+  <footer>
+    <div class="container">
+      © 2026 aubin ·
+      <a href="https://github.com/376x" target="_blank" rel="noopener">github.com/376x</a> ·
+      Powered by GitHub Pages
+    </div>
+  </footer>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <script>hljs.highlightAll();</script>
+</body>
+</html>

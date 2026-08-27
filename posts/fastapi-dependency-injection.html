@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FastAPI 依赖注入 Depends 的正确打开方式 · aubin 的博客</title>
+  <meta name="description" content="依赖嵌套、yield 资源管理、Annotated 复用 —— 把 FastAPI 的 Depends 用出设计模式的味道。" />
+  <link rel="stylesheet" href="../assets/style.css" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
+</head>
+<body>
+  <!-- Navbar -->
+  <nav>
+    <div class="nav-inner">
+      <a class="nav-logo" href="../index.html"><span class="dot"></span>aubin</a>
+      <div class="nav-links">
+        <a href="../index.html">首页</a>
+        <a href="../blog.html" class="active">博客</a>
+        <a href="../index.html#projects">项目</a>
+        <a href="../about.html">关于</a>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post">
+    <a class="back" href="../blog.html">← 返回博客列表</a>
+    <h1 class="title">FastAPI 依赖注入 Depends 的正确打开方式</h1>
+    <div class="post-meta">
+      <span class="date">2026-08-10</span>
+      <span># FastAPI</span><span># Dependency Injection</span><span># Python</span>
+    </div>
+
+    <div class="prose">
+      <p>
+        很多教程把 <code>Depends</code> 讲成"给路由函数传参的工具"，这只是它的表面。
+        依赖注入（DI）真正的价值在于：<strong>把横切逻辑从业务代码里抽离出去，
+        并让框架帮你管理它们的生命周期</strong>。这篇文章整理我在项目中反复使用的几种模式。
+      </p>
+
+      <h2>1. 从最普通的依赖开始</h2>
+      <p>任何<em>可调用对象</em>都可以作为依赖：普通函数、async 函数、类实例化。</p>
+
+<pre><code class="language-python">from typing import Annotated
+from fastapi import Depends, FastAPI
+
+app = FastAPI()
+
+async def pagination(page: int = 1, page_size: int = 20) -&gt; dict:
+    """校验并规范分页参数"""
+    if page &gt; 100:
+        raise ValueError("page too large")
+    return {"page": page, "page_size": page_size}
+
+@app.get("/items")
+async def list_items(params: Annotated[dict, Depends(pagination)]):
+    offset = (params["page"] - 1) * params["page_size"]
+    return fetch_items(offset=offset, limit=params["page_size"])</code></pre>
+
+      <p>
+        注意：查询参数声明出现在了依赖 <code>pagination</code> 里。
+        FastAPI 会把依赖的签名<strong>递归地纳入 OpenAPI 文档</strong>，
+        所以 Swagger UI 上会自动出现 <code>page</code> 和 <code>page_size</code> 参数 —— 校验和文档都免费获得。
+      </p>
+
+      <h2>2. Annotated 别名：一次声明，处处复用</h2>
+      <p>
+        每次都写 <code>Annotated[dict, Depends(pagination)]</code> 太啰嗦。
+        用类型别名把它固化下来，这是 FastAPI 官方目前推荐的风格：
+      </p>
+
+<pre><code class="language-python">from typing import Annotated
+from fastapi import Depends
+
+PageParams = Annotated[dict, Depends(pagination)]
+
+@app.get("/items")
+async def list_items(params: PageParams): ...
+
+@app.get("/orders")
+async def list_orders(params: PageParams): ...</code></pre>
+
+      <blockquote><p>业务代码只剩一个干净的 <code>params: PageParams</code>，
+      校验逻辑的修改集中在 <code>pagination</code> 一处 —— 这就是 DI 带来的解耦。</p></blockquote>
+
+      <h2>3. yield 依赖：不只是注入，还有"善后"</h2>
+      <p>
+        生成器函数可以作为依赖：<code>yield</code> 之前的代码在<strong>请求进入时执行</strong>，
+        之后的代码在<strong>响应返回后执行</strong> —— 天然的资源管理钩子，类似 contextmanager：
+      </p>
+
+<pre><code class="language-python">from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+SessionDep = Annotated[AsyncSession, Depends(get_db)]
+
+async def get_db() -&gt; AsyncIterator[AsyncSession]:
+    async with session_factory() as session:
+        try:
+            yield session              # ---- 请求处理阶段 ----
+            await session.commit()     # 业务没有抛异常才提交
+        except Exception:
+            await session.rollback()
+            raise
+
+@app.post("/orders")
+async def create_order(payload: OrderIn, db: SessionDep):
+    order = Order(**payload.model_dump())
+    db.add(order)
+    await db.flush()
+    return {"id": order.id}</code></pre>
+
+      <ul>
+        <li><strong>commit/rollback 收口在依赖里</strong>，路由函数再也不用关心事务边界；</li>
+        <li>即使业务抛出异常，<code>yield</code> 之后的清理代码依然会执行；</li>
+        <li>同一请求内多个地方依赖 <code>get_db</code> 时，默认 <code>use_cache=True</code> 会<strong>复用同一个 session</strong>，不会重复建连。</li>
+      </ul>
+
+      <h2>4. 依赖嵌套：组合出复杂逻辑</h2>
+      <p>依赖本身也可以有自己的依赖，FastAPI 会构建一棵依赖树并逐层解析：</p>
+
+<pre><code class="language-python">from fastapi import Header, HTTPException, status
+
+async def verify_token(
+    x_token: Annotated[str, Header(alias="X-Token")]
+) -&gt; str:
+    if not await redis.sismember("valid_tokens", x_token):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token",
+        )
+    return x_token
+
+TokenDep = Annotated[str, Depends(verify_token)]
+
+async def current_user(token: TokenDep, db: SessionDep) -&gt; User:
+    user = await db.get(User, decode_token_to_id(token))
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
+
+CurrentUser = Annotated[User, Depends(current_user)]
+
+@app.get("/me")
+async def me(user: CurrentUser):
+    return user</code></pre>
+
+      <p>
+        注意 <code>current_user</code> 同时消费了 <code>TokenDep</code> 和 <code>SessionDep</code>，
+        而这两者各自可能又有更深层的依赖。<strong>你只需要声明"我需要什么"，解析顺序、缓存、生命周期都交给框架。</strong>
+      </p>
+
+      <h2>5. 路由组级依赖：批量挂鉴权</h2>
+      <p>如果一个 <code>APIRouter</code> 下所有接口都需要登录，不必逐个添加参数：</p>
+
+<pre><code class="language-python">from fastapi import APIRouter, Depends
+
+admin_router = APIRouter(
+    prefix="/admin",
+    dependencies=[Depends(require_admin)],   # 只做门禁，不注入值
+)
+
+@admin_router.delete("/users/{uid}")
+async def delete_user(uid: int):
+    # 能走到这里说明 require_admin 已通过
+    ...</code></pre>
+
+      <p><code>dependencies=[...]</code> 里的依赖会被正常执行和校验，只是返回值不会注入到路由函数 ——
+      特别适合鉴权、限流、审计日志这类"只检查、不使用结果"的场景。</p>
+
+      <h2>小结</h2>
+      <ul>
+        <li>可调用对象皆依赖：函数、async 函数、类都行；</li>
+        <li><code>Annotated</code> 别名是现代 FastAPI 项目里依赖复用的标准姿势；</li>
+        <li><code>yield</code> 依赖 = setup + teardown，把事务、连接的收口代码移出业务层；</li>
+        <li>依赖树自动解析与缓存，复杂的组合逻辑拆成小依赖即可；</li>
+        <li>路由组级 <code>dependencies</code> 用于不注入值的横切检查。</li>
+      </ul>
+      <p>
+        把这些模式用熟之后，你会发现 FastAPI 项目的分层可以非常干净：
+        路由薄薄一层做协议转换，业务收敛在 service，资源与横切逻辑全部由依赖树托底。
+      </p>
+    </div>
+
+    <div class="end-mark">— 完 —</div>
+  </article>
+
+  <div class="next-posts container">
+    <h3>继续阅读</h3>
+    <a class="post-item" href="fastapi-async.html">
+      <h3>FastAPI 异步避坑指南：async def 还是 def？</h3>
+      <p>事件循环阻塞是 FastAPI 性能问题的头号元凶。一文讲清两种路由声明的本质区别与正确选择。</p>
+    </a>
+    <a class="post-item" href="fastapi-lifespan.html">
+      <h3>用 Lifespan 管理 FastAPI 应用资源</h3>
+      <p>告别已废弃的 on_event：用 asynccontextmanager 管理数据库连接池、HTTP 客户端等启动/关闭资源。</p>
+    </a>
+  </div>
+
+  <footer>
+    <div class="container">
+      © 2026 aubin ·
+      <a href="https://github.com/376x" target="_blank" rel="noopener">github.com/376x</a> ·
+      Powered by GitHub Pages
+    </div>
+  </footer>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <script>hljs.highlightAll();</script>
+</body>
+</html>

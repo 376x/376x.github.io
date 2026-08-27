@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Pydantic v2 实战：更快、更严格的输入校验 · aubin 的博客</title>
+  <meta name="description" content="Pydantic v2 迁移实战：Rust 内核性能提升、field_validator/model_validator 新写法、computed_field 与序列化控制。" />
+  <link rel="stylesheet" href="../assets/style.css" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
+</head>
+<body>
+  <!-- Navbar -->
+  <nav>
+    <div class="nav-inner">
+      <a class="nav-logo" href="../index.html"><span class="dot"></span>aubin</a>
+      <div class="nav-links">
+        <a href="../index.html">首页</a>
+        <a href="../blog.html" class="active">博客</a>
+        <a href="../index.html#projects">项目</a>
+        <a href="../about.html">关于</a>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post">
+    <a class="back" href="../blog.html">← 返回博客列表</a>
+    <h1 class="title">Pydantic v2 实战：更快、更严格的输入校验</h1>
+    <div class="post-meta">
+      <span class="date">2026-08-26</span>
+      <span># FastAPI</span><span># Pydantic</span><span># 迁移实践</span>
+    </div>
+
+    <div class="prose">
+      <p>
+        Pydantic v2 把校验核心用 Rust 重写（pydantic-core），基准测试的序列化/反序列化速度普遍有数倍提升。
+        对以 I/O 校验为日常的 FastAPI 项目来说，这是最值得升级的一次大版本。
+        不过 v2 的 API 变化不小，这篇文章整理迁移中最常踩的点和新写法。
+      </p>
+
+      <h2>1. 高频破坏性变更速查表</h2>
+
+      <table>
+        <tr><th>v1 写法</th><th>v2 写法</th></tr>
+        <tr><td><code>class Config:</code></td><td><code>model_config = ConfigDict(...)</code></td></tr>
+        <tr><td><code>.dict()</code> / <code>.json()</code></td><td><code>.model_dump()</code> / <code>.model_dump_json()</code></td></tr>
+        <tr><td><code>.parse_obj()</code> / <code>.parse_raw()</code></td><td><code>.model_validate()</code> / <code>.model_validate_json()</code></td></tr>
+        <tr><td><code>@validator</code></td><td><code>@field_validator</code></td></tr>
+        <tr><td><code>@root_validator</code></td><td><code>@model_validator</code></td></tr>
+        <tr><td><code>orm_mode = True</code></td><td><code>from_attributes = True</code></td></tr>
+        <tr><td><code>.schema()</code></td><td><code>.model_json_schema()</code></td></tr>
+      </table>
+
+      <p>好消息是官方提供了 <code>bump-pydantic</code> 自动迁移工具，能机械替换大部分；
+      真正需要人工处理的，是下文这些"语义有变化"的地方。</p>
+
+      <h2>2. 配置：ConfigDict 取代内嵌 Config 类</h2>
+
+<pre><code class="language-python">from pydantic import BaseModel, ConfigDict
+
+class UserOut(BaseModel):
+    model_config = ConfigDict(
+        from_attributes=True,   # 原 orm_mode，支持 ORM 对象直接转换
+        str_strip_whitespace=True,
+        extra="forbid",          # 多余字段直接报错（默认 ignore）
+    )
+
+    id: int
+    name: str
+    email: str</code></pre>
+
+      <p>在 FastAPI 中，返回 ORM 对象的响应模型现在只需要：
+      <code>model_config = ConfigDict(from_attributes=True)</code>，
+      然后 <code>@router.get(..., response_model=UserOut)</code> 即可。</p>
+
+      <h2>3. field_validator：字段级校验的新姿势</h2>
+      <p>v1 的 <code>@validator("field")</code> 变成 <code>@field_validator("field")</code>，
+      且必须用 <code>classmethod</code> 风格书写。最大的变化是 <code>mode</code> 参数：</p>
+
+<pre><code class="language-python">from pydantic import BaseModel, field_validator
+
+class OrderIn(BaseModel):
+    phone: str
+    coupon: str | None = None
+
+    @field_validator("phone")
+    @classmethod
+    def validate_phone(cls, v: str) -&gt; str:
+        """默认 mode="after"：拿到的是类型转换后的值"""
+        cleaned = v.replace("-", "").replace(" ", "")
+        if not (cleaned.isdigit() and len(cleaned) == 11):
+            raise ValueError("手机号格式不正确")
+        return cleaned
+
+    @field_validator("coupon", mode="before")
+    @classmethod
+    def empty_to_none(cls, v: object) -&gt; object:
+        """mode="before"：拿到原始输入，适合清洗脏数据"""
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v</code></pre>
+
+      <blockquote><p>经验法则：<strong>清洗数据用 before，校验业务规则用 after</strong>。
+      before 拿到的是未转换的原始输入，after 拿到的已经是目标类型的实例。</p></blockquote>
+
+      <h2>4. model_validator：跨字段校验</h2>
+
+<pre><code class="language-python">from typing import Self
+from pydantic import BaseModel, model_validator
+
+class DateRange(BaseModel):
+    start: datetime
+    end: datetime
+    min_days: int = 0
+
+    @model_validator(mode="after")
+    def check_range(self) -&gt; Self:
+        if self.end &lt; self.start:
+            raise ValueError("end 不能早于 start")
+        if (self.end - self.start).days &lt; self.min_days:
+            raise ValueError(f"间隔至少 {self.min_days} 天")
+        return self</code></pre>
+
+      <p><code>mode="after"</code> 的 model_validator 拿到的是已构造完成的模型实例（所以是 <code>Self</code>），做跨字段一致性检查非常顺手。</p>
+
+      <h2>5. Annotated + Field：约束复用</h2>
+      <p>把常用的约束条件抽成类型别名，整个项目的入口校验风格就统一了：</p>
+
+<pre><code class="language-python">from decimal import Decimal
+from typing import Annotated
+from pydantic import Field
+
+Amount = Annotated[Decimal, Field(ge=0, decimal_places=2)]
+PageNum = Annotated[int, Field(ge=1, le=10000)]
+
+class RefundIn(BaseModel):
+    order_id: int
+    amount: Amount
+    reason: str = Field(min_length=5, max_length=200)</code></pre>
+
+      <h2>6. computed_field：模型派生字段进序列化</h2>
+
+<pre><code class="language-python">from pydantic import BaseModel, computed_field
+
+class Product(BaseModel):
+    price: Decimal
+    tax_rate: float
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def price_with_tax(self) -&gt; Decimal:
+        return (self.price * Decimal(str(1 + self.tax_rate))).quantize(Decimal("0.01"))</code></pre>
+
+      <p>导出到 JSON 时 <code>price_with_tax</code> 会自动出现在结果里，并且进入 OpenAPI schema。</p>
+
+      <h2>7. 序列化控制的常用开关</h2>
+
+<pre><code class="language-python">order = Order.model_validate(raw)
+
+order.model_dump()                        # dict，默认包含全部字段
+order.model_dump(exclude_unset=True)      # 只含用户显式传入的字段（PATCH 局部更新神器）
+order.model_dump(exclude={"internal_id"})
+order.model_dump(by_alias=True)           # 输出别名（如 camelCase API 字段）
+Order.model_validate_json(json_bytes)     # 直接从 bytes 解析，走 Rust 快速通道</code></pre>
+
+      <p>重点推荐 <strong>PATCH 场景用 <code>exclude_unset=True</code></strong>：
+      只有调用方显式传了的字段才会进入更新字典，再也不用手写一堆 <code>if "field" in body</code>。</p>
+
+      <h2>小结</h2>
+      <ul>
+        <li>先跑 <code>bump-pydantic</code>，再手动处理校验器和配置的语义差异；</li>
+        <li><code>mode="before"</code> 清洗脏数据、<code>mode="after"</code> 做业务校验；</li>
+        <li>约束收敛到 Annotated 别名，全项目校验口径一致；</li>
+        <li>PATCH 更新配 <code>exclude_unset=True</code>，省掉大量样板代码。</li>
+      </ul>
+    </div>
+
+    <div class="end-mark">— 完 —</div>
+  </article>
+
+  <div class="next-posts container">
+    <h3>继续阅读</h3>
+    <a class="post-item" href="fastapi-lifespan.html">
+      <h3>用 Lifespan 管理 FastAPI 应用资源</h3>
+      <p>告别已废弃的 on_event：用一个函数管理启动/关闭资源。</p>
+    </a>
+    <a class="post-item" href="fastapi-dependency-injection.html">
+      <h3>FastAPI 依赖注入 Depends 的正确打开方式</h3>
+      <p>把 Depends 用出设计模式的味道。</p>
+    </a>
+  </div>
+
+  <footer>
+    <div class="container">
+      © 2026 aubin ·
+      <a href="https://github.com/376x" target="_blank" rel="noopener">github.com/376x</a> ·
+      Powered by GitHub Pages
+    </div>
+  </footer>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <script>hljs.highlightAll();</script>
+</body>
+</html>
